@@ -5,16 +5,28 @@
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+-- Possibly change the b to IO
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module Core
-  ( crawl
+  ( crawlAppian
+  , crawlSql
   , runQuery
+  , module ClassyPrelude
+  , module Control.Monad.Base
+  , module Control.Monad.Trans.Control
+  , SessionState (..)
+  , Control.Monad.State.Lazy.get
+  , Control.Monad.State.Lazy.put
+  , getCSRFToken
+  , taskReq
+  , makeReq
+  , AppianCrawler
   ) where
 
 import ClassyPrelude
-import Control.Monad.State.Lazy
+import Control.Monad.State.Lazy hiding (mapM_)
 import Network.HTTP.Client
 import Network.HTTP.Conduit
 import Network.HTTP.Simple
@@ -35,7 +47,8 @@ import Text.XML.HXT.Core
 
 import Data.Aeson
 
-domain = "portal-dev.usac.org"
+-- domain = "portal-dev.usac.org"
+domain = "portal-test.usac.org"
 protocol = "https"
 baseURL = protocol <> "://" <> domain
 
@@ -50,8 +63,27 @@ dbReq :: MonadThrow m => m Request
 dbReq = setRequestHeaders baseHeaders
   <$> parseUrlThrow (baseURL <> "/database/index.php")
 
+suiteReq :: MonadThrow m => m Request
+suiteReq = setRequestHeaders baseHeaders
+  <$> parseUrlThrow (baseURL <> "/suite")
+
+newtype TaskId = TaskId String
+  deriving (Show, Read, Eq, Monoid)
+
+newtype AppianCrawler m a = AppianCrawler
+  { runAppian :: StateT SessionState m a }
+  deriving (Functor, Applicative, Monad, MonadThrow, MonadIO, MonadTrans, MonadState SessionState)
+
+instance MonadBase b m => MonadBase b (AppianCrawler m) where
+  liftBase = lift . liftBase
+
+instance MonadBaseControl b m => MonadBaseControl b (AppianCrawler m) where
+  type StM (AppianCrawler b) a = StM (StateT SessionState b) a
+  liftBaseWith f = AppianCrawler $ liftBaseWith $ \rib -> f (rib . runAppian)
+  restoreM = AppianCrawler . restoreM
+
 newtype SqlCrawler m a = SqlCrawler
-  { runCrawler :: StateT SessionState m a}
+  { runCrawler :: AppianCrawler m a}
   deriving (Functor, Applicative, Monad, MonadThrow, MonadIO, MonadTrans, MonadState SessionState)
 
 newtype SqlToken = SqlToken (ByteString, Maybe ByteString)
@@ -70,8 +102,8 @@ instance MonadBaseControl b m => MonadBaseControl b (SqlCrawler m) where
   liftBaseWith f = SqlCrawler $ liftBaseWith $ \rib -> f (rib . runCrawler)
   restoreM = SqlCrawler . restoreM
 
-crawl :: MonadBaseControl IO m => SqlCrawler m a -> m a
-crawl crawler = bracket alloc free go
+crawlAppian :: MonadBaseControl IO m => AppianCrawler m a -> m a
+crawlAppian crawler = bracket alloc free go
   where
     alloc = do
       mgr <- liftBase $ do
@@ -83,10 +115,14 @@ crawl crawler = bracket alloc free go
     free (SessionState mgr cookies _) = do
       liftBase $ do
         putStrLn "Logging out..."
-        print cookies
       (_, status, _) <- liftBase $ join $ makeReq mgr cookies <$> logoutReq
       liftBase $ print status
-    go session = evalStateT (runCrawler crawler) session
+    go session = evalStateT (runAppian crawler) session
+
+crawlSql :: (MonadIO m, MonadThrow m, MonadBaseControl IO m) => SqlCrawler m a -> AppianCrawler m a
+crawlSql (SqlCrawler appianCrawler) = do
+  dbLogin
+  appianCrawler
 
 makeReq
   :: (MonadIO m, MonadThrow m, MonadBaseControl IO m) =>
@@ -111,45 +147,56 @@ makeReq' mgr req = do
 
 login :: (MonadIO m, MonadThrow m, MonadBaseControl IO m) => Manager -> m (CookieJar, Status, Maybe SqlToken)
 login mgr = do
-  (cookies, status, _) <- join $ makeReq mgr mempty <$> dbReq
+  (cookies, status, _) <- join $ makeReq mgr mempty <$> suiteReq
   print status
-  req <- authReq (getCSRFToken cookies)
+  req <- authReq (fmap (\(name, value) -> (name, Just value)) $ getCSRFToken cookies)
 
   print req
 
   (cookies', status, body) <- makeReq mgr cookies req
   print status
 
-  (cookies'', status', body') <- join $ makeReq mgr cookies' <$> dbReq
+  return (cookies', status, Nothing)
+
+dbLogin :: (MonadIO m, MonadThrow m, MonadBaseControl IO m) => AppianCrawler m ()
+dbLogin = do
+  (SessionState mgr cookies mTok) <- get
+  (cookies', status', body') <- join $ makeReq mgr cookies <$> dbReq
   print status'
 
   let sqlToken = BL.toStrict <$> getToken body'
       wrapTok = (SqlToken . (,) "token" . Just)
 
   case wrapTok <$> sqlToken of
-    Nothing -> throwM $ RequestException "Could not find a token!" cookies' status body
-    mTok -> return (cookies'', status', mTok)
+    Nothing -> throwM $ RequestException "Could not find a token!" cookies status' body'
+    mTok -> put $ SessionState mgr cookies' mTok
 
 baseHeaders :: [(HeaderName, ByteString)]
 baseHeaders = [ ("Accept-Language", "en-US,en;q=0.5")
               , ("Upgrade-Insecure-Requests", "1")
               , ("Accept-Encoding", "gzip, deflate, br")
-              , ("User-Agent", "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:48.0) Gecko/20100101 Firefox/48.0")
+              , ("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_6) AppleWebKit/602.1.50 (KHTML, like Gecko) Version/10.0 Safari/602.1.50")
               , ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
               ]
 
 authParams :: [(ByteString, Maybe ByteString)]
-authParams = [ ("un", Just "joshua.mccartney@itgfirm.com")
-           , ("pw", Just "Booy'et7")
+authParams = [ ("un", Just "app1_sd1_full1@mailinator.com")
+           , ("pw", Just "USACuser123$")
            , ("spring_security_remember_me", Just "on")
            ]
 
-getCSRFToken = runLA (arrL destroyCookieJar >>> cookieHasName "__appianCsrfToken" >>> constA "X-APPIAN-CSRF-TOKEN" &&& arr (Just . cookie_value))
+getCSRFToken :: MonadThrow m => CookieJar -> m (ByteString, ByteString)
+getCSRFToken cookies = do
+  let r = runLA (arrL destroyCookieJar >>> cookieHasName "__appianCsrfToken" >>> constA "X-APPIAN-CSRF-TOKEN" &&& arr (cookie_value))
+
+  case r cookies of
+    [t] -> return t
+    _ -> throwM $ NoTokenException "There is not CSRF token present!"
 
 cookieHasName :: ArrowList a => ByteString -> a Cookie Cookie
 cookieHasName str = isA (\c -> cookie_name c == str)
 
-runQuery :: ByteString -> SqlCrawler IO BL.ByteString
+runQuery :: (MonadIO m, MonadThrow m, MonadBaseControl IO m) => ByteString -> SqlCrawler m BL.ByteString
 runQuery query = do
   (SessionState mgr cookies mTok) <- get
   putStrLn "Running query..."
@@ -161,8 +208,6 @@ runQuery query = do
   put (SessionState mgr cookies' mTok)
   print status
   return body
-
-
   
 logoutReq :: MonadThrow m => m Request
 logoutReq = setRequestHeaders baseHeaders
@@ -283,6 +328,49 @@ buildKeyColumnUsage _ = throwM $ InvalidColumnData "Incorrect number of fields f
 
 keyColumnUsage :: [String] -> Either SomeException KeyColumnUsage
 keyColumnUsage = buildKeyColumnUsage
+
+getTaskStatus :: (MonadIO m, MonadThrow m, MonadBaseControl IO m) => TaskId -> AppianCrawler m BL.ByteString
+getTaskStatus taskId = do
+  (SessionState mgr cookies mTok) <- get
+  putStrLn "Getting task status..."
+  (_, tok) <- getCSRFToken cookies
+  (cookies', status, body) <- join $ makeReq mgr cookies <$> statusReq taskId tok
+  print status
+  put $ SessionState mgr cookies' mTok
+  return body
+
+statusReq :: MonadThrow m => TaskId -> ByteString -> m Request
+statusReq (TaskId taskId) csrfToken = setQueryString taskParams
+  <$> setRequestMethod "POST"
+  <$> setRequestBody "accepted"
+  <$> setRequestHeader "Accept" ["application/vnd.appian.tv.ui+json"]
+  <$> setRequestHeader "X-HTTP-Method-Override" ["PUT"]
+  <$> appianReq (("X-APPIAN-CSRF-TOKEN", csrfToken) : baseHeaders) ("/suite/rest/a/task/latest/" <> taskId <> "/status")
+
+taskReq :: MonadThrow m => ByteString -> m Request
+taskReq csrfToken = setQueryString taskParams
+  <$> appianReq (("X-APPIAN-CSRF-TOKEN", csrfToken) : baseHeaders <> taskHeaders) "/suite/api/feed/tempo"
+
+taskHeaders :: [(HeaderName, ByteString)]
+taskHeaders = [ ("Referer", "https://portal-test.usac.org/suite/tempo/news/all")
+              , ("x-appian-suppress-www-authenticate", "true")
+              , ("Accept", "application/atom+json,application/json")
+              , ("X-Appian-Ui-State", "stateful")
+              , ("X-Atom-Content-Type", "application/html")
+              ]
+
+taskParams :: [(ByteString, Maybe ByteString)]
+taskParams = [ ("m", Just "menu-tasks")
+             , ("t", Just "t")
+             , ("s", Just "pt")
+             , ("defaultFacets", Just "%5Bstatus-open%5D")
+             ]
+  
+-- https://portal-test.usac.org/suite/tempo/tasks/assignedtome
+
+appianReq :: MonadThrow m => [(HeaderName, ByteString)] -> String -> m Request
+appianReq headers path = setRequestHeaders headers
+  <$> parseUrlThrow (baseURL <> path)
 
 data ParseJSONException = ParseJSONException Text BL.ByteString
 
