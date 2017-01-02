@@ -23,6 +23,10 @@ module Core
   , taskReq
   , makeReq
   , AppianCrawler
+  , TaskId
+  , toTaskId
+  , getTaskAttributes
+  , getTaskStatus
   ) where
 
 import ClassyPrelude
@@ -47,8 +51,8 @@ import Text.XML.HXT.Core
 
 import Data.Aeson
 
--- domain = "portal-dev.usac.org"
-domain = "portal-test.usac.org"
+domain = "portal-dev.usac.org"
+-- domain = "portal-test.usac.org"
 protocol = "https"
 baseURL = protocol <> "://" <> domain
 
@@ -69,6 +73,19 @@ suiteReq = setRequestHeaders baseHeaders
 
 newtype TaskId = TaskId String
   deriving (Show, Read, Eq, Monoid)
+
+newtype ReadException = ReadException Text
+
+instance Show ReadException where
+  show (ReadException msg) = "ReadException: " <> show msg
+
+instance Exception ReadException
+
+toTaskId :: MonadThrow m => String -> m TaskId
+toTaskId txt = do
+  case isPrefixOf "t-" txt of
+    True -> return $ TaskId $ drop 2 txt
+    False -> throwM $ ReadException $ pack txt <> " does not appear to be a valid task id."
 
 newtype AppianCrawler m a = AppianCrawler
   { runAppian :: StateT SessionState m a }
@@ -102,7 +119,7 @@ instance MonadBaseControl b m => MonadBaseControl b (SqlCrawler m) where
   liftBaseWith f = SqlCrawler $ liftBaseWith $ \rib -> f (rib . runCrawler)
   restoreM = SqlCrawler . restoreM
 
-crawlAppian :: MonadBaseControl IO m => AppianCrawler m a -> m a
+crawlAppian :: MonadBaseControl IO m => AppianCrawler m a -> m (a, SessionState)
 crawlAppian crawler = bracket alloc free go
   where
     alloc = do
@@ -117,7 +134,7 @@ crawlAppian crawler = bracket alloc free go
         putStrLn "Logging out..."
       (_, status, _) <- liftBase $ join $ makeReq mgr cookies <$> logoutReq
       liftBase $ print status
-    go session = evalStateT (runAppian crawler) session
+    go session = runStateT (runAppian crawler) session
 
 crawlSql :: (MonadIO m, MonadThrow m, MonadBaseControl IO m) => SqlCrawler m a -> AppianCrawler m a
 crawlSql (SqlCrawler appianCrawler) = do
@@ -145,6 +162,13 @@ makeReq' mgr req = do
     body <- responseBody resp $$+- CC.sinkLazy
     return $ (responseCookieJar resp, responseStatus resp, body)
 
+makeAppianReq :: (MonadIO m, MonadThrow m, MonadBaseControl IO m) => Request -> AppianCrawler m (Status, BL.ByteString)
+makeAppianReq req = do
+  (SessionState mgr cookies mTok) <- get
+  (cookies', status, body) <- makeReq mgr cookies req
+  put $ SessionState mgr cookies' mTok
+  return (status, body)
+
 login :: (MonadIO m, MonadThrow m, MonadBaseControl IO m) => Manager -> m (CookieJar, Status, Maybe SqlToken)
 login mgr = do
   (cookies, status, _) <- join $ makeReq mgr mempty <$> suiteReq
@@ -161,6 +185,7 @@ login mgr = do
 dbLogin :: (MonadIO m, MonadThrow m, MonadBaseControl IO m) => AppianCrawler m ()
 dbLogin = do
   (SessionState mgr cookies mTok) <- get
+  print cookies
   (cookies', status', body') <- join $ makeReq mgr cookies <$> dbReq
   print status'
 
@@ -168,20 +193,25 @@ dbLogin = do
       wrapTok = (SqlToken . (,) "token" . Just)
 
   case wrapTok <$> sqlToken of
-    Nothing -> throwM $ RequestException "Could not find a token!" cookies status' body'
+    Nothing -> throwM $ RequestException "Could not find a token!" cookies' status' body'
     mTok -> put $ SessionState mgr cookies' mTok
 
 baseHeaders :: [(HeaderName, ByteString)]
-baseHeaders = [ ("Accept-Language", "en-US,en;q=0.5")
+baseHeaders = [ ("Accept-Language", "en-US,en;q=0.8")
               , ("Upgrade-Insecure-Requests", "1")
-              , ("Accept-Encoding", "gzip, deflate, br")
+              , ("Accept-Encoding", "gzip, deflate, sdch, br")
               , ("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_6) AppleWebKit/602.1.50 (KHTML, like Gecko) Version/10.0 Safari/602.1.50")
               , ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+              , ("Connection", "keep-alive")
               ]
 
 authParams :: [(ByteString, Maybe ByteString)]
-authParams = [ ("un", Just "app1_sd1_full1@mailinator.com")
-           , ("pw", Just "USACuser123$")
+-- authParams = [ ("un", Just "app1_sd1_full1@mailinator.com")
+--            , ("pw", Just "USACuser123$")
+--            , ("spring_security_remember_me", Just "on")
+--            ]
+authParams = [ ("un", Just "joshua.mccartney@itgfirm.com")
+           , ("pw", Just "Booy'et7")
            , ("spring_security_remember_me", Just "on")
            ]
 
@@ -339,17 +369,37 @@ getTaskStatus taskId = do
   put $ SessionState mgr cookies' mTok
   return body
 
+getTaskAttributes :: (MonadIO m, MonadThrow m, MonadBaseControl IO m) => TaskId -> AppianCrawler m BL.ByteString
+getTaskAttributes taskId = do
+  (SessionState mgr cookies mTok) <- get
+  putStrLn "Getting task attributes..."
+  (_, tok) <- getCSRFToken cookies
+  (cookies', status, body) <- join $ makeReq mgr cookies <$> taskAttribsReq taskId tok
+  print status
+  put $ SessionState mgr cookies' mTok
+  return body
+
+taskAttribsReq :: MonadThrow m => TaskId -> ByteString -> m Request
+taskAttribsReq (TaskId taskId) csrfToken = setRequestHeader "X-APPIAN-CSRF-TOKEN" [csrfToken]
+  <$> appianReq baseHeaders ("/suite/rest/a/task/latest/" <> taskId <> "/attributes")
+
 statusReq :: MonadThrow m => TaskId -> ByteString -> m Request
 statusReq (TaskId taskId) csrfToken = setQueryString taskParams
   <$> setRequestMethod "POST"
   <$> setRequestBody "accepted"
-  <$> setRequestHeader "Accept" ["application/vnd.appian.tv.ui+json"]
-  <$> setRequestHeader "X-HTTP-Method-Override" ["PUT"]
-  <$> appianReq (("X-APPIAN-CSRF-TOKEN", csrfToken) : baseHeaders) ("/suite/rest/a/task/latest/" <> taskId <> "/status")
+  <$> appianReq (("X-APPIAN-CSRF-TOKEN", csrfToken) : baseHeaders <> taskStatusHeaders) ("/suite/rest/a/task/latest/" <> taskId <> "/status")
 
 taskReq :: MonadThrow m => ByteString -> m Request
 taskReq csrfToken = setQueryString taskParams
   <$> appianReq (("X-APPIAN-CSRF-TOKEN", csrfToken) : baseHeaders <> taskHeaders) "/suite/api/feed/tempo"
+
+taskStatusHeaders :: [(HeaderName, ByteString)]
+taskStatusHeaders = [ ("Accept", "application/atom+json,application/json")
+                    , ("X-Appian-Ui-State", "stateful")
+                    , ("X-Appian-Ui-State", "stateful")
+                    , ("Accept-Encoding", "gzip, deflate")
+                    , ("X-HTTP-Method-Override", "PUT")
+                    ]
 
 taskHeaders :: [(HeaderName, ByteString)]
 taskHeaders = [ ("Referer", "https://portal-test.usac.org/suite/tempo/news/all")

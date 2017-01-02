@@ -24,14 +24,18 @@ instance FromJSON Feed where
 
 data Task = Task
   { _content :: Content
-  , _taskId :: Text
+  , _taskId :: TaskId
   }
   deriving Show
 
 instance FromJSON Task where
-  parseJSON (Object o) =
-    Task <$> o .: "content"
-         <*> o .: "id"
+  parseJSON (Object o) = do
+    eTaskId <- toTaskId <$> o .: "id"
+    case eTaskId of
+      Left exc -> error $ show exc
+      Right taskId -> 
+        Task <$> o .: "content"
+             <*> pure taskId
 
 newtype Content = Content {_val :: [Text]}
   deriving Show
@@ -57,3 +61,6 @@ getTasks = do
   case decode body of
     Nothing -> return []
     Just root -> return $ root ^. feed ^. entries
+
+filterTasks :: Text -> [Task] -> [Task]
+filterTasks name = filter (\x -> name `elem` (x ^. content ^. val))
