@@ -34,7 +34,7 @@ import Control.Monad.State.Lazy hiding (mapM_)
 import Network.HTTP.Client
 import Network.HTTP.Conduit
 import Network.HTTP.Simple
-import Control.Monad.Trans.Resource
+import Control.Monad.Trans.Resource hiding (throwM)
 import Control.Monad.Trans.Control
 import Control.Monad.Trans.Class
 import Control.Monad.Base
@@ -119,7 +119,7 @@ instance MonadBaseControl b m => MonadBaseControl b (SqlCrawler m) where
   liftBaseWith f = SqlCrawler $ liftBaseWith $ \rib -> f (rib . runCrawler)
   restoreM = SqlCrawler . restoreM
 
-crawlAppian :: MonadBaseControl IO m => AppianCrawler m a -> m (a, SessionState)
+crawlAppian :: (MonadMask m, MonadBaseControl IO m) => AppianCrawler m a -> m (a, SessionState)
 crawlAppian crawler = bracket alloc free go
   where
     alloc = do

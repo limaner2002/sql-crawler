@@ -4,7 +4,7 @@
 module HTTPClient where
 
 import Data.Time
-import Control.Monad.Trans.Resource
+import Control.Monad.Trans.Resource hiding (throwM)
 import Control.Monad.Trans.Reader
 import ClassyPrelude
 import Network.HTTP.Client
